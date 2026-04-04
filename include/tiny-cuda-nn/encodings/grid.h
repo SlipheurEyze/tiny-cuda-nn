@@ -59,7 +59,8 @@ __global__ void kernel_grid(
 	const T* __restrict__ grid,
 	MatrixView<const float> positions_in,
 	T* __restrict__ encoded_positions,
-	float* __restrict__ dy_dx
+	float* __restrict__ dy_dx,
+	const float* __restrict__ rotation_matrices = nullptr
 ) {
 	const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= num_elements) return;
@@ -101,15 +102,50 @@ __global__ void kernel_grid(
 	float pos_derivative[N_POS_DIMS];
 	uvec<N_POS_DIMS> pos_grid;
 
-	if (interpolation_type == InterpolationType::Nearest || interpolation_type == InterpolationType::Linear) {
-		TCNN_PRAGMA_UNROLL
-		for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
-			pos_fract(positions_in(dim, i), &pos[dim], &pos_derivative[dim], &pos_grid[dim], scale, identity_fun, identity_derivative);
+	if (rotation_matrices != nullptr && N_POS_DIMS == 3) {
+		// R-MHE: Read all positions, scale, rotate around center, then floor
+		float scaled[3];
+		for (uint32_t dim = 0; dim < 3; ++dim) {
+			scaled[dim] = fmaf(scale, positions_in(dim, i), 0.5f);
+		}
+
+		const float* R = rotation_matrices + level * 9;
+		float rotated[3];
+		for (uint32_t dim = 0; dim < 3; ++dim) {
+			rotated[dim] = R[dim*3+0] * (scaled[0] - 0.5f)
+			             + R[dim*3+1] * (scaled[1] - 0.5f)
+			             + R[dim*3+2] * (scaled[2] - 0.5f)
+			             + 0.5f;
+		}
+
+		if (interpolation_type == InterpolationType::Nearest || interpolation_type == InterpolationType::Linear) {
+			for (uint32_t dim = 0; dim < 3; ++dim) {
+				float tmp = floorf(rotated[dim]);
+				pos_grid[dim] = (uint32_t)(int)tmp;
+				pos[dim] = rotated[dim] - tmp;
+				pos_derivative[dim] = 1.0f;
+			}
+		} else {
+			for (uint32_t dim = 0; dim < 3; ++dim) {
+				float tmp = floorf(rotated[dim]);
+				pos_grid[dim] = (uint32_t)(int)tmp;
+				float frac = rotated[dim] - tmp;
+				pos_derivative[dim] = smoothstep_derivative(frac);
+				pos[dim] = smoothstep(frac);
+			}
 		}
 	} else {
-		TCNN_PRAGMA_UNROLL
-		for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
-			pos_fract(positions_in(dim, i), &pos[dim], &pos_derivative[dim], &pos_grid[dim], scale, smoothstep, smoothstep_derivative);
+		// Standard MHE (no rotation)
+		if (interpolation_type == InterpolationType::Nearest || interpolation_type == InterpolationType::Linear) {
+			TCNN_PRAGMA_UNROLL
+			for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
+				pos_fract(positions_in(dim, i), &pos[dim], &pos_derivative[dim], &pos_grid[dim], scale, identity_fun, identity_derivative);
+			}
+		} else {
+			TCNN_PRAGMA_UNROLL
+			for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
+				pos_fract(positions_in(dim, i), &pos[dim], &pos_derivative[dim], &pos_grid[dim], scale, smoothstep, smoothstep_derivative);
+			}
 		}
 	}
 
@@ -204,6 +240,20 @@ __global__ void kernel_grid(
 			}
 		}
 
+		// For R-MHE, transform gradients from rotated space back to input space:
+		// dy/dx = dy/d(rotated) * d(rotated)/d(scaled) = dy/d(rotated) * R_l
+		// Since grads are computed as dy/d(rotated) * scale, we need to apply R_l^T
+		if (rotation_matrices != nullptr && N_POS_DIMS == 3) {
+			const float* R = rotation_matrices + level * 9;
+			for (uint32_t f = 0; f < N_FEATURES_PER_LEVEL; ++f) {
+				float g0 = grads[f][0], g1 = grads[f][1], g2 = grads[f][2];
+				// Multiply by R^T (transpose): column j of R becomes row j
+				grads[f][0] = R[0*3+0] * g0 + R[1*3+0] * g1 + R[2*3+0] * g2;
+				grads[f][1] = R[0*3+1] * g0 + R[1*3+1] * g1 + R[2*3+1] * g2;
+				grads[f][2] = R[0*3+2] * g0 + R[1*3+2] * g1 + R[2*3+2] * g2;
+			}
+		}
+
 		TCNN_PRAGMA_UNROLL
 		for (uint32_t f = 0; f < N_FEATURES_PER_LEVEL; ++f) {
 			((vec<N_POS_DIMS>*)dy_dx)[i + (level * N_FEATURES_PER_LEVEL + f) * num_elements] = grads[f];
@@ -225,7 +275,8 @@ __global__ void kernel_grid_backward(
 	const GridType grid_type,
 	GRAD_T* __restrict__ grid_gradient,
 	MatrixView<const float> positions_in,
-	const T* __restrict__ dL_dy
+	const T* __restrict__ dL_dy,
+	const float* __restrict__ rotation_matrices = nullptr
 ) {
 	const uint32_t i = ((blockIdx.x * blockDim.x + threadIdx.x) * N_FEATURES_PER_THREAD) / N_FEATURES_PER_LEVEL;
 	if (i >= num_elements) return;
@@ -257,15 +308,46 @@ __global__ void kernel_grid_backward(
 	float pos[N_POS_DIMS];
 	uvec<N_POS_DIMS> pos_grid;
 
-	if (interpolation_type == InterpolationType::Nearest || interpolation_type == InterpolationType::Linear) {
-		TCNN_PRAGMA_UNROLL
-		for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
-			pos_fract(positions_in(dim, i), &pos[dim], &pos_grid[dim], scale, identity_fun);
+	if (rotation_matrices != nullptr && N_POS_DIMS == 3) {
+		float scaled[3];
+		for (uint32_t dim = 0; dim < 3; ++dim) {
+			scaled[dim] = fmaf(scale, positions_in(dim, i), 0.5f);
+		}
+
+		const float* R = rotation_matrices + level * 9;
+		float rotated[3];
+		for (uint32_t dim = 0; dim < 3; ++dim) {
+			rotated[dim] = R[dim*3+0] * (scaled[0] - 0.5f)
+			             + R[dim*3+1] * (scaled[1] - 0.5f)
+			             + R[dim*3+2] * (scaled[2] - 0.5f)
+			             + 0.5f;
+		}
+
+		if (interpolation_type == InterpolationType::Nearest || interpolation_type == InterpolationType::Linear) {
+			for (uint32_t dim = 0; dim < 3; ++dim) {
+				float tmp = floorf(rotated[dim]);
+				pos_grid[dim] = (uint32_t)(int)tmp;
+				pos[dim] = rotated[dim] - tmp;
+			}
+		} else {
+			for (uint32_t dim = 0; dim < 3; ++dim) {
+				float tmp = floorf(rotated[dim]);
+				pos_grid[dim] = (uint32_t)(int)tmp;
+				float frac = rotated[dim] - tmp;
+				pos[dim] = smoothstep(frac);
+			}
 		}
 	} else {
-		TCNN_PRAGMA_UNROLL
-		for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
-			pos_fract(positions_in(dim, i), &pos[dim], &pos_grid[dim], scale, smoothstep);
+		if (interpolation_type == InterpolationType::Nearest || interpolation_type == InterpolationType::Linear) {
+			TCNN_PRAGMA_UNROLL
+			for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
+				pos_fract(positions_in(dim, i), &pos[dim], &pos_grid[dim], scale, identity_fun);
+			}
+		} else {
+			TCNN_PRAGMA_UNROLL
+			for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
+				pos_fract(positions_in(dim, i), &pos[dim], &pos_grid[dim], scale, smoothstep);
+			}
 		}
 	}
 
@@ -365,7 +447,8 @@ __global__ void kernel_grid_backward_input_backward_grid(
 	MatrixView<const float> positions_in,
 	const T* __restrict__ dL_dy,
 	// outputs
-	GRAD_T* __restrict__ grid_gradient
+	GRAD_T* __restrict__ grid_gradient,
+	const float* __restrict__ rotation_matrices = nullptr
 ) {
 	const uint32_t i = ((blockIdx.x * blockDim.x + threadIdx.x) * N_FEATURES_PER_THREAD) / N_FEATURES_PER_LEVEL;
 	if (i >= num_elements) return;
@@ -398,15 +481,48 @@ __global__ void kernel_grid_backward_input_backward_grid(
 	float pos_derivative[N_POS_DIMS];
 	uvec<N_POS_DIMS> pos_grid;
 
-	if (interpolation_type == InterpolationType::Nearest || interpolation_type == InterpolationType::Linear) {
-		TCNN_PRAGMA_UNROLL
-		for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
-			pos_fract(positions_in(dim, i), &pos[dim], &pos_derivative[dim], &pos_grid[dim], scale, identity_fun, identity_derivative);
+	if (rotation_matrices != nullptr && N_POS_DIMS == 3) {
+		float scaled[3];
+		for (uint32_t dim = 0; dim < 3; ++dim) {
+			scaled[dim] = fmaf(scale, positions_in(dim, i), 0.5f);
+		}
+
+		const float* R = rotation_matrices + level * 9;
+		float rotated[3];
+		for (uint32_t dim = 0; dim < 3; ++dim) {
+			rotated[dim] = R[dim*3+0] * (scaled[0] - 0.5f)
+			             + R[dim*3+1] * (scaled[1] - 0.5f)
+			             + R[dim*3+2] * (scaled[2] - 0.5f)
+			             + 0.5f;
+		}
+
+		if (interpolation_type == InterpolationType::Nearest || interpolation_type == InterpolationType::Linear) {
+			for (uint32_t dim = 0; dim < 3; ++dim) {
+				float tmp = floorf(rotated[dim]);
+				pos_grid[dim] = (uint32_t)(int)tmp;
+				pos[dim] = rotated[dim] - tmp;
+				pos_derivative[dim] = 1.0f;
+			}
+		} else {
+			for (uint32_t dim = 0; dim < 3; ++dim) {
+				float tmp = floorf(rotated[dim]);
+				pos_grid[dim] = (uint32_t)(int)tmp;
+				float frac = rotated[dim] - tmp;
+				pos_derivative[dim] = smoothstep_derivative(frac);
+				pos[dim] = smoothstep(frac);
+			}
 		}
 	} else {
-		TCNN_PRAGMA_UNROLL
-		for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
-			pos_fract(positions_in(dim, i), &pos[dim], &pos_derivative[dim], &pos_grid[dim], scale, smoothstep, smoothstep_derivative);
+		if (interpolation_type == InterpolationType::Nearest || interpolation_type == InterpolationType::Linear) {
+			TCNN_PRAGMA_UNROLL
+			for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
+				pos_fract(positions_in(dim, i), &pos[dim], &pos_derivative[dim], &pos_grid[dim], scale, identity_fun, identity_derivative);
+			}
+		} else {
+			TCNN_PRAGMA_UNROLL
+			for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
+				pos_fract(positions_in(dim, i), &pos[dim], &pos_derivative[dim], &pos_grid[dim], scale, smoothstep, smoothstep_derivative);
+			}
 		}
 	}
 
@@ -422,10 +538,27 @@ __global__ void kernel_grid_backward_input_backward_grid(
 		return;
 	}
 
+	// For R-MHE: transform dL_ddLdx from input space to rotated space
+	// dL_ddLdx is in input space, but pos_derivative is in rotated space
+	// We need dL_ddLdx in rotated space: dL_ddLdx_rot = R * dL_ddLdx
+	float dL_ddLdx_transformed[N_POS_DIMS];
+	if (rotation_matrices != nullptr && N_POS_DIMS == 3) {
+		const float* R = rotation_matrices + level * 9;
+		for (uint32_t dim = 0; dim < 3; ++dim) {
+			dL_ddLdx_transformed[dim] = R[dim*3+0] * dL_ddLdx((uint32_t)0, i)
+			                          + R[dim*3+1] * dL_ddLdx((uint32_t)1, i)
+			                          + R[dim*3+2] * dL_ddLdx((uint32_t)2, i);
+		}
+	} else {
+		for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
+			dL_ddLdx_transformed[dim] = dL_ddLdx(dim, i);
+		}
+	}
+
 	// for N-linear interpolation
 	TCNN_PRAGMA_UNROLL
 	for (uint32_t grad_dim = 0; grad_dim < N_POS_DIMS; ++grad_dim) {
-		float grad_in = scale * dL_ddLdx(grad_dim, i) * pos_derivative[grad_dim];
+		float grad_in = scale * dL_ddLdx_transformed[grad_dim] * pos_derivative[grad_dim];
 		TCNN_PRAGMA_UNROLL
 		for (uint32_t idx = 0; idx < (1 << (N_POS_DIMS-1)); ++idx) {
 			float weight = grad_in;
@@ -471,7 +604,8 @@ __global__ void kernel_grid_backward_input_backward_input(
 	const T* __restrict__ dL_dy,
 	const T* __restrict__ grid,
 	// outputs
-	MatrixView<float> dL_dx
+	MatrixView<float> dL_dx,
+	const float* __restrict__ rotation_matrices = nullptr
 ) {
 	const uint32_t i = ((blockIdx.x * blockDim.x + threadIdx.x) * N_FEATURES_PER_THREAD) / N_FEATURES_PER_LEVEL;
 	if (i >= num_elements) return;
@@ -500,15 +634,50 @@ __global__ void kernel_grid_backward_input_backward_input(
 	float pos_2nd_derivative[N_POS_DIMS];
 	uvec<N_POS_DIMS> pos_grid;
 
-	if (interpolation_type == InterpolationType::Nearest || interpolation_type == InterpolationType::Linear) {
-		TCNN_PRAGMA_UNROLL
-		for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
-			pos_fract(positions_in(dim, i), &pos[dim], &pos_derivative[dim], &pos_2nd_derivative[dim], &pos_grid[dim], scale, identity_fun, identity_derivative, identity_2nd_derivative);
+	if (rotation_matrices != nullptr && N_POS_DIMS == 3) {
+		float scaled[3];
+		for (uint32_t dim = 0; dim < 3; ++dim) {
+			scaled[dim] = fmaf(scale, positions_in(dim, i), 0.5f);
+		}
+
+		const float* R = rotation_matrices + level * 9;
+		float rotated[3];
+		for (uint32_t dim = 0; dim < 3; ++dim) {
+			rotated[dim] = R[dim*3+0] * (scaled[0] - 0.5f)
+			             + R[dim*3+1] * (scaled[1] - 0.5f)
+			             + R[dim*3+2] * (scaled[2] - 0.5f)
+			             + 0.5f;
+		}
+
+		if (interpolation_type == InterpolationType::Nearest || interpolation_type == InterpolationType::Linear) {
+			for (uint32_t dim = 0; dim < 3; ++dim) {
+				float tmp = floorf(rotated[dim]);
+				pos_grid[dim] = (uint32_t)(int)tmp;
+				pos[dim] = rotated[dim] - tmp;
+				pos_derivative[dim] = 1.0f;
+				pos_2nd_derivative[dim] = 0.0f;
+			}
+		} else {
+			for (uint32_t dim = 0; dim < 3; ++dim) {
+				float tmp = floorf(rotated[dim]);
+				pos_grid[dim] = (uint32_t)(int)tmp;
+				float frac = rotated[dim] - tmp;
+				pos_2nd_derivative[dim] = smoothstep_2nd_derivative(frac);
+				pos_derivative[dim] = smoothstep_derivative(frac);
+				pos[dim] = smoothstep(frac);
+			}
 		}
 	} else {
-		TCNN_PRAGMA_UNROLL
-		for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
-			pos_fract(positions_in(dim, i), &pos[dim], &pos_derivative[dim], &pos_2nd_derivative[dim], &pos_grid[dim], scale, smoothstep, smoothstep_derivative, smoothstep_2nd_derivative);
+		if (interpolation_type == InterpolationType::Nearest || interpolation_type == InterpolationType::Linear) {
+			TCNN_PRAGMA_UNROLL
+			for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
+				pos_fract(positions_in(dim, i), &pos[dim], &pos_derivative[dim], &pos_2nd_derivative[dim], &pos_grid[dim], scale, identity_fun, identity_derivative, identity_2nd_derivative);
+			}
+		} else {
+			TCNN_PRAGMA_UNROLL
+			for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
+				pos_fract(positions_in(dim, i), &pos[dim], &pos_derivative[dim], &pos_2nd_derivative[dim], &pos_grid[dim], scale, smoothstep, smoothstep_derivative, smoothstep_2nd_derivative);
+			}
 		}
 	}
 
@@ -538,17 +707,33 @@ __global__ void kernel_grid_backward_input_backward_input(
 		return dL_dx_dim;
 	};
 
+	// For R-MHE: transform dL_ddLdx from input space to rotated space
+	float dL_ddLdx_transformed[N_POS_DIMS];
+	if (rotation_matrices != nullptr && N_POS_DIMS == 3) {
+		const float* R = rotation_matrices + level * 9;
+		for (uint32_t dim = 0; dim < 3; ++dim) {
+			dL_ddLdx_transformed[dim] = R[dim*3+0] * dL_ddLdx((uint32_t)0, i)
+			                          + R[dim*3+1] * dL_ddLdx((uint32_t)1, i)
+			                          + R[dim*3+2] * dL_ddLdx((uint32_t)2, i);
+		}
+	} else {
+		for (uint32_t dim = 0; dim < N_POS_DIMS; ++dim) {
+			dL_ddLdx_transformed[dim] = dL_ddLdx(dim, i);
+		}
+	}
+
 	tvec<float, N_POS_DIMS> grad_in_diag;
 	tvec<float, N_POS_DIMS> grad_in_other;
 	TCNN_PRAGMA_UNROLL
 	for (uint32_t grad_dim = 0; grad_dim < N_POS_DIMS; ++grad_dim) {
 		// from diagonal part of Hessian
-		grad_in_diag[grad_dim] = scale * scale * dL_ddLdx(grad_dim, i) * pos_2nd_derivative[grad_dim];
+		grad_in_diag[grad_dim] = scale * scale * dL_ddLdx_transformed[grad_dim] * pos_2nd_derivative[grad_dim];
 		// from other part of Hessian
-		grad_in_other[grad_dim] = scale * scale * dL_ddLdx(grad_dim, i) * pos_derivative[grad_dim]; // will do " * pos_derivative[real_other_grad_dim] " later
+		grad_in_other[grad_dim] = scale * scale * dL_ddLdx_transformed[grad_dim] * pos_derivative[grad_dim];
 	}
 
 	static constexpr bool dimension_greater_than_1 = (N_POS_DIMS > 1);
+	float grad_out_rotated[N_POS_DIMS] = {0.0f};
 	TCNN_PRAGMA_UNROLL
 	for (uint32_t grad_dim = 0; grad_dim < N_POS_DIMS; ++grad_dim) {
 		float grad_out = 0;
@@ -618,7 +803,21 @@ __global__ void kernel_grid_backward_input_backward_input(
 			}
 		}
 
-		atomic_add_gmem_float((float*)&dL_dx(grad_dim, i), grad_out);
+		grad_out_rotated[grad_dim] = grad_out;
+	}
+
+	// For R-MHE: transform gradient from rotated space back to input space via R^T
+	if (rotation_matrices != nullptr && N_POS_DIMS == 3) {
+		const float* R = rotation_matrices + level * 9;
+		float g0 = grad_out_rotated[0], g1 = grad_out_rotated[1], g2 = grad_out_rotated[2];
+		atomic_add_gmem_float((float*)&dL_dx((uint32_t)0, i), R[0*3+0] * g0 + R[1*3+0] * g1 + R[2*3+0] * g2);
+		atomic_add_gmem_float((float*)&dL_dx((uint32_t)1, i), R[0*3+1] * g0 + R[1*3+1] * g1 + R[2*3+1] * g2);
+		atomic_add_gmem_float((float*)&dL_dx((uint32_t)2, i), R[0*3+2] * g0 + R[1*3+2] * g1 + R[2*3+2] * g2);
+	} else {
+		TCNN_PRAGMA_UNROLL
+		for (uint32_t grad_dim = 0; grad_dim < N_POS_DIMS; ++grad_dim) {
+			atomic_add_gmem_float((float*)&dL_dx(grad_dim, i), grad_out_rotated[grad_dim]);
+		}
 	}
 }
 
@@ -678,7 +877,8 @@ public:
 		bool stochastic_interpolation,
 		InterpolationType interpolation_type,
 		GridType grid_type,
-		bool fixed_point_pos
+		bool fixed_point_pos,
+		bool enable_rmhe = false
 	) :
 	m_n_features{n_features},
 	m_log2_hashmap_size{log2_hashmap_size},
@@ -687,7 +887,8 @@ public:
 	m_stochastic_interpolation{stochastic_interpolation},
 	m_interpolation_type{interpolation_type},
 	m_grid_type{grid_type},
-	m_fixed_point_pos{fixed_point_pos}
+	m_fixed_point_pos{fixed_point_pos},
+	m_enable_rmhe{enable_rmhe}
 	{
 		m_n_levels = div_round_up(m_n_features, N_FEATURES_PER_LEVEL);
 		uint32_t offset = 0;
@@ -733,6 +934,83 @@ public:
 
 		if (n_features % N_FEATURES_PER_LEVEL != 0) {
 			throw std::runtime_error{fmt::format("GridEncoding: n_features={} must be a multiple of N_FEATURES_PER_LEVEL={}", n_features, N_FEATURES_PER_LEVEL)};
+		}
+
+		// R-MHE: Generate icosahedral rotation matrices if enabled
+		if (m_enable_rmhe && N_POS_DIMS == 3) {
+			const float phi = (1.0f + std::sqrt(5.0f)) / 2.0f;
+			float ico_vertices[12][3] = {
+				{0, 1, phi}, {0, -1, phi}, {0, 1, -phi}, {0, -1, -phi},
+				{1, phi, 0}, {-1, phi, 0}, {1, -phi, 0}, {-1, -phi, 0},
+				{phi, 0, 1}, {-phi, 0, 1}, {phi, 0, -1}, {-phi, 0, -1}
+			};
+
+			// Normalize each vertex
+			for (uint32_t v = 0; v < 12; ++v) {
+				float len = std::sqrt(ico_vertices[v][0]*ico_vertices[v][0]
+				                    + ico_vertices[v][1]*ico_vertices[v][1]
+				                    + ico_vertices[v][2]*ico_vertices[v][2]);
+				ico_vertices[v][0] /= len;
+				ico_vertices[v][1] /= len;
+				ico_vertices[v][2] /= len;
+			}
+
+			std::vector<float> rotations(m_n_levels * 9);
+
+			for (uint32_t l = 0; l < m_n_levels; ++l) {
+				const float* d = ico_vertices[l % 12]; // target direction
+
+				// Rodrigues: rotation from z=(0,0,1) to d
+				// axis = cross(z, d) = (-d[1], d[0], 0)
+				// cos_angle = dot(z, d) = d[2]
+				float cos_a = d[2];
+
+				if (cos_a > 1.0f - 1e-6f) {
+					// d ~= z, identity matrix
+					float* R = rotations.data() + l * 9;
+					R[0]=1; R[1]=0; R[2]=0;
+					R[3]=0; R[4]=1; R[5]=0;
+					R[6]=0; R[7]=0; R[8]=1;
+				} else if (cos_a < -1.0f + 1e-6f) {
+					// d ~= -z, 180 degree rotation around x-axis
+					float* R = rotations.data() + l * 9;
+					R[0]=1;  R[1]=0;  R[2]=0;
+					R[3]=0;  R[4]=-1; R[5]=0;
+					R[6]=0;  R[7]=0;  R[8]=-1;
+				} else {
+					// General case: Rodrigues formula
+					// K = skew-symmetric matrix of axis
+					float ax = -d[1]; // cross(z, d).x
+					float ay = d[0];  // cross(z, d).y
+					float az = 0.0f;  // cross(z, d).z
+
+					// Normalize the axis
+					float axis_len = std::sqrt(ax*ax + ay*ay + az*az);
+					ax /= axis_len;
+					ay /= axis_len;
+					az /= axis_len;
+
+					float sin_a = axis_len; // |cross(z,d)| = sin(angle) (since both are unit vectors)
+
+					// R = I + sin(a)*K + (1-cos(a))*K^2
+					// K = [0, -az, ay; az, 0, -ax; -ay, ax, 0]
+					float one_minus_cos = 1.0f - cos_a;
+
+					float* R = rotations.data() + l * 9;
+					R[0] = cos_a + ax*ax*one_minus_cos;
+					R[1] = ax*ay*one_minus_cos - az*sin_a;
+					R[2] = ax*az*one_minus_cos + ay*sin_a;
+					R[3] = ay*ax*one_minus_cos + az*sin_a;
+					R[4] = cos_a + ay*ay*one_minus_cos;
+					R[5] = ay*az*one_minus_cos - ax*sin_a;
+					R[6] = az*ax*one_minus_cos - ay*sin_a;
+					R[7] = az*ay*one_minus_cos + ax*sin_a;
+					R[8] = cos_a + az*az*one_minus_cos;
+				}
+			}
+
+			m_rotation_matrices.resize_and_copy_from_host(rotations);
+			log_debug("GridEncoding: R-MHE enabled with icosahedral rotations for {} levels", m_n_levels);
 		}
 	}
 
@@ -797,7 +1075,8 @@ public:
 			use_inference_params ? this->inference_params() : this->params(),
 			forward->positions.data() ? forward->positions.view() : input.view(),
 			encoded_positions_soa,
-			forward->dy_dx.data()
+			forward->dy_dx.data(),
+			m_enable_rmhe ? m_rotation_matrices.data() : nullptr
 		);
 
 		if (output && output->layout() == AoS) {
@@ -884,7 +1163,8 @@ public:
 				m_grid_type,
 				grid_gradient,
 				forward.positions.data() ? forward.positions.view() : input.view(), // positions SoA
-				dL_dy_rm // gradients SoA
+				dL_dy_rm, // gradients SoA
+				m_enable_rmhe ? m_rotation_matrices.data() : nullptr
 			);
 
 			if (!std::is_same<grad_t, T>::value) {
@@ -981,7 +1261,8 @@ public:
 				forward.positions.data() ? forward.positions.view() : input.view(), // positions SoA
 				dL_dy_rm, // gradients SoA
 				// outputs
-				grid_gradient
+				grid_gradient,
+				m_enable_rmhe ? m_rotation_matrices.data() : nullptr
 			);
 
 			if (!std::is_same<grad_t, T>::value) {
@@ -1036,7 +1317,8 @@ public:
 				dL_dy_rm,
 				use_inference_params ? this->inference_params() : this->params(),
 				// outputs
-				dL_dinput->view()
+				dL_dinput->view(),
+				m_enable_rmhe ? m_rotation_matrices.data() : nullptr
 			);
 		}
 	}
@@ -1126,6 +1408,10 @@ public:
 
 		if (m_grid_type == GridType::Hash) {
 			result["log2_hashmap_size"] = m_log2_hashmap_size;
+		}
+
+		if (m_enable_rmhe) {
+			result["enable_rmhe"] = true;
 		}
 
 		return result;
@@ -1720,6 +2006,10 @@ private:
 	InterpolationType m_interpolation_type;
 	GridType m_grid_type;
 	bool m_fixed_point_pos;
+
+	// R-MHE: Rotated Multi-resolution Hash Encoding
+	bool m_enable_rmhe = false;
+	GPUMemory<float> m_rotation_matrices; // m_n_levels * 9 floats (3x3 per level, row-major)
 };
 
 template <typename T, uint32_t N_FEATURES_PER_LEVEL, HashType HASH_TYPE>
@@ -1752,7 +2042,8 @@ create_grid_encoding_templated_2(uint32_t n_dims_to_encode, const json& encoding
 	encoding.value("stochastic_interpolation", false), \
 	string_to_interpolation_type(encoding.value("interpolation", "Linear")), \
 	grid_type, \
-	fixed_point_pos,
+	fixed_point_pos, \
+	encoding.value("enable_rmhe", false),
 
 	// If higher-dimensional hash encodings are desired, corresponding switch cases can be added
 	switch (n_dims_to_encode) {
@@ -1798,7 +2089,8 @@ create_grid_encoding_templated_2(uint32_t n_dims_to_encode, const json& encoding
 	encoding.value("stochastic_interpolation", false), \
 	string_to_interpolation_type(encoding.value("interpolation", "Linear")), \
 	grid_type, \
-	fixed_point_pos,
+	fixed_point_pos, \
+	encoding.value("enable_rmhe", false),
 
 	// If higher-dimensional hash encodings are desired, corresponding switch cases can be added
 	switch (n_dims_to_encode) {
@@ -1840,11 +2132,10 @@ MultiLevelEncoding<T>* create_grid_encoding(uint32_t n_dims_to_encode, const jso
 	switch (hash_type) {
 		case HashType::CoherentPrime: return create_grid_encoding_templated_1<T, HashType::CoherentPrime>(n_dims_to_encode, encoding);
 		case HashType::BaseConvert: throw std::runtime_error{"GridEncoding: compiled without BaseConvert hash support."}; 
-		case HashType::Prime: throw std::runtime_error{"GridEncoding: compiled without Prime hash support."};
+		case HashType::Prime: return create_grid_encoding_templated_1<T, HashType::Prime>(n_dims_to_encode, encoding);
 		case HashType::ReversedPrime: throw std::runtime_error{"GridEncoding: compiled without ReversedPrime hash support."};
 		case HashType::Rng: throw std::runtime_error{"GridEncoding: compiled without Rng hash support."};
-		// case HashType::BaseConvert: return create_grid_encoding_templated_1<T, HashType::BaseConvert>(n_dims_to_encode, encoding); 
-		// case HashType::Prime: return create_grid_encoding_templated_1<T, HashType::Prime>(n_dims_to_encode, encoding);
+		// case HashType::BaseConvert: return create_grid_encoding_templated_1<T, HashType::BaseConvert>(n_dims_to_encode, encoding);
 		// case HashType::ReversedPrime: return create_grid_encoding_templated_1<T, HashType::ReversedPrime>(n_dims_to_encode, encoding);
 		// case HashType::Rng: return create_grid_encoding_templated_1<T, HashType::Rng>(n_dims_to_encode, encoding);
 		default: throw std::runtime_error{"GridEncoding: invalid hash type."};
