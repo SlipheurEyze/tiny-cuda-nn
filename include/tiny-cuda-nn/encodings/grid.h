@@ -2052,8 +2052,8 @@ create_grid_encoding_templated_2(uint32_t n_dims_to_encode, const json& encoding
 		case 3: return new GridEncodingTemplated<T, 3, N_FEATURES_PER_LEVEL, HASH_TYPE>{ TCNN_GRID_PARAMS };
 		case 4: return new GridEncodingTemplated<T, 4, N_FEATURES_PER_LEVEL, HASH_TYPE>{ TCNN_GRID_PARAMS };
 		case 5: return new GridEncodingTemplated<T, 5, N_FEATURES_PER_LEVEL, HASH_TYPE>{ TCNN_GRID_PARAMS };
-		case 6: return new GridEncodingTemplated<T, 6, N_FEATURES_PER_LEVEL, HASH_TYPE>{ TCNN_GRID_PARAMS };
-		case 7: return new GridEncodingTemplated<T, 7, N_FEATURES_PER_LEVEL, HASH_TYPE>{ TCNN_GRID_PARAMS };
+		// case 6: return new GridEncodingTemplated<T, 6, N_FEATURES_PER_LEVEL, HASH_TYPE>{ TCNN_GRID_PARAMS };
+		// case 7: return new GridEncodingTemplated<T, 7, N_FEATURES_PER_LEVEL, HASH_TYPE>{ TCNN_GRID_PARAMS };
 		default: throw std::runtime_error{"GridEncoding: number of input dims must be 2 or 3."};
 	}
 #undef TCNN_GRID_PARAMS
@@ -2099,8 +2099,8 @@ create_grid_encoding_templated_2(uint32_t n_dims_to_encode, const json& encoding
 		case 3: return new GridEncodingTemplated<T, 3, N_FEATURES_PER_LEVEL, HashType::BaseConvert>{ TCNN_GRID_PARAMS };
 		case 4: return new GridEncodingTemplated<T, 4, N_FEATURES_PER_LEVEL, HashType::BaseConvert>{ TCNN_GRID_PARAMS };
 		case 5: return new GridEncodingTemplated<T, 5, N_FEATURES_PER_LEVEL, HashType::BaseConvert>{ TCNN_GRID_PARAMS };
-		case 6: return new GridEncodingTemplated<T, 6, N_FEATURES_PER_LEVEL, HashType::BaseConvert>{ TCNN_GRID_PARAMS };
-		case 7: return new GridEncodingTemplated<T, 7, N_FEATURES_PER_LEVEL, HashType::BaseConvert>{ TCNN_GRID_PARAMS };
+		// case 6: return new GridEncodingTemplated<T, 6, N_FEATURES_PER_LEVEL, HashType::BaseConvert>{ TCNN_GRID_PARAMS };
+		// case 7: return new GridEncodingTemplated<T, 7, N_FEATURES_PER_LEVEL, HashType::BaseConvert>{ TCNN_GRID_PARAMS };
 		case 8: return new GridEncodingTemplated<T, 8, N_FEATURES_PER_LEVEL, HashType::BaseConvert>{ TCNN_GRID_PARAMS };
 		case 9: return new GridEncodingTemplated<T, 9, N_FEATURES_PER_LEVEL, HashType::BaseConvert>{ TCNN_GRID_PARAMS };
 		case 10: return new GridEncodingTemplated<T, 10, N_FEATURES_PER_LEVEL, HashType::BaseConvert>{ TCNN_GRID_PARAMS };
